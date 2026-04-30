@@ -10,5 +10,10 @@ data/train.parquet
 data/dev.parquet
 data/sample_1M.parquet
 
+# Geo data downloads
+data/taxi_zones/
+data/taxi_zones.zip
+data/taxi_zone_lookup.csv
+
 # Docker cache
 .docker_cache/
