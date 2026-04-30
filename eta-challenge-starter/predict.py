@@ -12,7 +12,6 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 _MODEL_PATH = Path(__file__).parent / "model.pkl"
 
@@ -26,28 +25,65 @@ if isinstance(_BUNDLE, dict) and "model" in _BUNDLE:
     _CENTROIDS = _BUNDLE["centroids"]
     _FEATURE_NAMES = _BUNDLE["feature_names"]
     _IS_IMPROVED = True
+
+    # Pre-build hash-based lookup tables for fast per-request inference
+    _PAIR_LOOKUP = {}
+    ps = _ZONE_STATS["pair_stats"]
+    for _, r in ps.iterrows():
+        key = (int(r["pickup_zone"]), int(r["dropoff_zone"]))
+        _PAIR_LOOKUP[key] = (
+            float(r["pair_median"]), float(r["pair_mean"]),
+            float(r["pair_count"]), float(r["pair_q25"]), float(r["pair_q75"])
+        )
+
+    _PU_LOOKUP = {}
+    for _, r in _ZONE_STATS["pu_stats"].iterrows():
+        _PU_LOOKUP[int(r["zone"])] = (float(r["pu_median"]), float(r["pu_count"]))
+
+    _DO_LOOKUP = {}
+    for _, r in _ZONE_STATS["do_stats"].iterrows():
+        _DO_LOOKUP[int(r["zone"])] = (float(r["do_median"]), float(r["do_count"]))
+
+    _HOUR_PAIR_LOOKUP = {}
+    for _, r in _ZONE_STATS["hour_pair_stats"].iterrows():
+        key = (int(r["pickup_zone"]), int(r["dropoff_zone"]), int(r["hour"]))
+        _HOUR_PAIR_LOOKUP[key] = float(r["hour_pair_median"])
+
+    _GLOBAL_MEDIAN = _ZONE_STATS["global_median"]
+    _GLOBAL_MEAN = _ZONE_STATS["global_mean"]
+
+    del _ZONE_STATS  # free memory
 else:
     _MODEL = _BUNDLE
     _IS_IMPROVED = False
     if hasattr(_MODEL, "get_booster"):
         _MODEL.get_booster().feature_names = None
 
-# NYC holidays used during training
-NYC_HOLIDAYS_2023 = {
+# NYC holidays
+NYC_HOLIDAYS = {
     "2023-01-01", "2023-01-02", "2023-01-16", "2023-02-20",
     "2023-05-29", "2023-06-19", "2023-07-04", "2023-09-04",
     "2023-10-09", "2023-11-10", "2023-11-23", "2023-11-24",
     "2023-12-25", "2023-12-26", "2023-12-31",
-    # 2024 holidays for eval
     "2024-01-01", "2024-01-15", "2024-02-19",
     "2024-05-27", "2024-06-19", "2024-07-04", "2024-09-02",
     "2024-10-14", "2024-11-11", "2024-11-28", "2024-11-29",
     "2024-12-25", "2024-12-26", "2024-12-31",
 }
 
+# Pre-compute sin/cos tables for cyclical features
+_HOUR_SIN = [math.sin(2 * math.pi * h / 24) for h in range(24)]
+_HOUR_COS = [math.cos(2 * math.pi * h / 24) for h in range(24)]
+_DOW_SIN = [math.sin(2 * math.pi * d / 7) for d in range(7)]
+_DOW_COS = [math.cos(2 * math.pi * d / 7) for d in range(7)]
+_MONTH_SIN = [math.sin(2 * math.pi * m / 12) for m in range(13)]
+_MONTH_COS = [math.cos(2 * math.pi * m / 12) for m in range(13)]
+
 
 def _predict_improved(request: dict) -> float:
-    """Predict using improved LightGBM model with rich features."""
+    """Predict using improved LightGBM model with rich features.
+    Optimized with hash-based lookups for fast per-request inference.
+    """
     ts = datetime.fromisoformat(request["requested_at"])
     pz = int(request["pickup_zone"])
     dz = int(request["dropoff_zone"])
@@ -57,126 +93,86 @@ def _predict_improved(request: dict) -> float:
     month = ts.month
     day = ts.day
 
-    # Build feature dict
-    feats = {}
-    feats["pickup_zone"] = pz
-    feats["dropoff_zone"] = dz
-    feats["passenger_count"] = pc
-    feats["hour"] = hour
-    feats["dow"] = dow
-    feats["month"] = month
-    feats["day"] = day
-
-    # Cyclical features
-    feats["hour_sin"] = math.sin(2 * math.pi * hour / 24)
-    feats["hour_cos"] = math.cos(2 * math.pi * hour / 24)
-    feats["dow_sin"] = math.sin(2 * math.pi * dow / 7)
-    feats["dow_cos"] = math.cos(2 * math.pi * dow / 7)
-    feats["month_sin"] = math.sin(2 * math.pi * month / 12)
-    feats["month_cos"] = math.cos(2 * math.pi * month / 12)
-
-    # Rush hour / time flags
-    feats["is_morning_rush"] = 1 if 7 <= hour <= 9 else 0
-    feats["is_evening_rush"] = 1 if 16 <= hour <= 19 else 0
-    feats["is_night"] = 1 if hour >= 22 or hour <= 5 else 0
-    feats["is_weekend"] = 1 if dow >= 5 else 0
-
-    # Holiday
-    date_str = ts.strftime("%Y-%m-%d")
-    feats["is_holiday"] = 1 if date_str in NYC_HOLIDAYS_2023 else 0
-
-    # Minute of day
-    feats["minute_of_day"] = hour * 60 + ts.minute
-
-    # Zone-pair stats
-    pair_stats = _ZONE_STATS["pair_stats"]
-    global_median = _ZONE_STATS["global_median"]
-    global_mean = _ZONE_STATS["global_mean"]
-
-    pair_row = pair_stats[
-        (pair_stats["pickup_zone"] == pz) & (pair_stats["dropoff_zone"] == dz)
-    ]
-    if len(pair_row) > 0:
-        row = pair_row.iloc[0]
-        feats["pair_median"] = float(row["pair_median"])
-        feats["pair_mean"] = float(row["pair_mean"])
-        feats["pair_count"] = float(row["pair_count"])
-        feats["pair_q25"] = float(row["pair_q25"])
-        feats["pair_q75"] = float(row["pair_q75"])
+    # Zone-pair stats via hash lookup
+    pair_key = (pz, dz)
+    if pair_key in _PAIR_LOOKUP:
+        p_med, p_mean, p_count, p_q25, p_q75 = _PAIR_LOOKUP[pair_key]
     else:
-        feats["pair_median"] = global_median
-        feats["pair_mean"] = global_mean
-        feats["pair_count"] = 0.0
-        feats["pair_q25"] = global_median * 0.6
-        feats["pair_q75"] = global_median * 1.5
+        p_med = _GLOBAL_MEDIAN
+        p_mean = _GLOBAL_MEAN
+        p_count = 0.0
+        p_q25 = _GLOBAL_MEDIAN * 0.6
+        p_q75 = _GLOBAL_MEDIAN * 1.5
 
-    feats["pair_iqr"] = feats["pair_q75"] - feats["pair_q25"]
-    feats["log_pair_count"] = math.log1p(feats["pair_count"])
-
-    # Pickup zone stats
-    pu_stats = _ZONE_STATS["pu_stats"]
-    pu_row = pu_stats[pu_stats["zone"] == pz]
-    if len(pu_row) > 0:
-        feats["pu_median"] = float(pu_row.iloc[0]["pu_median"])
-        feats["pu_count"] = float(pu_row.iloc[0]["pu_count"])
-    else:
-        feats["pu_median"] = global_median
-        feats["pu_count"] = 0.0
-
-    # Dropoff zone stats
-    do_stats = _ZONE_STATS["do_stats"]
-    do_row = do_stats[do_stats["zone"] == dz]
-    if len(do_row) > 0:
-        feats["do_median"] = float(do_row.iloc[0]["do_median"])
-        feats["do_count"] = float(do_row.iloc[0]["do_count"])
-    else:
-        feats["do_median"] = global_median
-        feats["do_count"] = 0.0
+    # Pickup / dropoff zone stats
+    pu_med, pu_count = _PU_LOOKUP.get(pz, (_GLOBAL_MEDIAN, 0.0))
+    do_med, do_count = _DO_LOOKUP.get(dz, (_GLOBAL_MEDIAN, 0.0))
 
     # Hour-pair stats
-    hour_pair_stats = _ZONE_STATS["hour_pair_stats"]
-    hp_row = hour_pair_stats[
-        (hour_pair_stats["pickup_zone"] == pz) &
-        (hour_pair_stats["dropoff_zone"] == dz) &
-        (hour_pair_stats["hour"] == hour)
+    hp_key = (pz, dz, hour)
+    hp_med = _HOUR_PAIR_LOOKUP.get(hp_key, p_med)
+
+    # Build feature array directly — order must match _FEATURE_NAMES
+    feats = [
+        pz,                         # pickup_zone
+        dz,                         # dropoff_zone
+        pc,                         # passenger_count
+        hour,                       # hour
+        dow,                        # dow
+        month,                      # month
+        day,                        # day
+        _HOUR_SIN[hour],            # hour_sin
+        _HOUR_COS[hour],            # hour_cos
+        _DOW_SIN[dow],              # dow_sin
+        _DOW_COS[dow],              # dow_cos
+        _MONTH_SIN[month],          # month_sin
+        _MONTH_COS[month],          # month_cos
+        1 if 7 <= hour <= 9 else 0,   # is_morning_rush
+        1 if 16 <= hour <= 19 else 0, # is_evening_rush
+        1 if hour >= 22 or hour <= 5 else 0,  # is_night
+        1 if dow >= 5 else 0,       # is_weekend
+        1 if ts.strftime("%Y-%m-%d") in NYC_HOLIDAYS else 0,  # is_holiday
+        hour * 60 + ts.minute,      # minute_of_day
+        p_med,                      # pair_median
+        p_mean,                     # pair_mean
+        p_count,                    # pair_count
+        p_q25,                      # pair_q25
+        p_q75,                      # pair_q75
+        p_q75 - p_q25,             # pair_iqr
+        math.log1p(p_count),       # log_pair_count
+        pu_med,                    # pu_median
+        pu_count,                  # pu_count
+        do_med,                    # do_median
+        do_count,                  # do_count
+        hp_med,                    # hour_pair_median
+        hp_med / (p_med + 1),      # hour_pair_ratio
+        1 if pz == dz else 0,     # same_zone
     ]
-    if len(hp_row) > 0:
-        feats["hour_pair_median"] = float(hp_row.iloc[0]["hour_pair_median"])
-    else:
-        feats["hour_pair_median"] = feats["pair_median"]
-
-    feats["hour_pair_ratio"] = feats["hour_pair_median"] / (feats["pair_median"] + 1)
-
-    # Same zone flag
-    feats["same_zone"] = 1 if pz == dz else 0
 
     # Geo features
     if _CENTROIDS:
         pu_lat, pu_lon = _CENTROIDS.get(pz, (40.75, -73.97))
         do_lat, do_lon = _CENTROIDS.get(dz, (40.75, -73.97))
-        feats["pu_lat"] = pu_lat
-        feats["pu_lon"] = pu_lon
-        feats["do_lat"] = do_lat
-        feats["do_lon"] = do_lon
+        feats.append(pu_lat)
+        feats.append(pu_lon)
+        feats.append(do_lat)
+        feats.append(do_lon)
 
         # Haversine
         dlat = math.radians(do_lat - pu_lat)
         dlon = math.radians(do_lon - pu_lon)
         a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(pu_lat)) * math.cos(math.radians(do_lat)) * math.sin(dlon / 2) ** 2
-        feats["haversine_km"] = 6371.0 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        feats.append(6371.0 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))  # haversine_km
 
-        # Manhattan proxy
-        feats["manhattan_proxy"] = abs(do_lat - pu_lat) + abs(do_lon - pu_lon)
+        feats.append(abs(do_lat - pu_lat) + abs(do_lon - pu_lon))  # manhattan_proxy
 
-        # Bearing
-        feats["bearing"] = math.degrees(math.atan2(
+        feats.append(math.degrees(math.atan2(
             math.sin(math.radians(do_lon - pu_lon)) * math.cos(math.radians(do_lat)),
             math.cos(math.radians(pu_lat)) * math.sin(math.radians(do_lat)) -
             math.sin(math.radians(pu_lat)) * math.cos(math.radians(do_lat)) * math.cos(math.radians(do_lon - pu_lon))
-        ))
+        )))  # bearing
 
-    # Build feature array in the same order as training
-    x = np.array([[feats.get(f, 0.0) for f in _FEATURE_NAMES]], dtype=np.float32)
+    x = np.array([feats], dtype=np.float32)
     return float(_MODEL.predict(x)[0])
 
 
